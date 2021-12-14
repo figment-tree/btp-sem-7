@@ -1,86 +1,49 @@
 import ee
-import time
-
-# Uncomment line 5 when running on colab.
-# ee.Authenticate()
-ee.Initialize()
+from functools import partial
+from joblib import Parallel
+from utils import get_districts, append_band, export_state_data
 
 
-def export_image(image, name, folder='data', scale=30, crs='EPSG:4326'):
-    task = ee.batch.Export.image.toDrive(image=image,
-                                         scale=scale,
-                                         folder=folder,
-                                         fileNamePrefix=name,
-                                         description="BTP 7th sem",
-                                         crs=crs,
-                                         fileFormat='GeoTIFF')
-    task.start()
-    while task.status()['state'] == 'RUNNING':
-        print('Running...')
-        time.sleep(10)
-    print(f'Exported {name}.')
+if __name__ == '__main__':
+    # Uncomment line 9 when running on colab.
+    # ee.Authenticate()
+    ee.Initialize()
 
+    state_names = ["Gujarat", "Bihar", "Haryana", "Madhya Pradesh",
+                   "Uttar Pradesh", "Rajasthan", "Punjab"]
 
-def appendBand(current, previous):
-    # Rename the band
-    previous = ee.Image(previous)
-    # current = current.select([0, 1, 2, 3, 4, 5, 6])
-    # Append it to the result
-    # (Note: only return current item on first element/iteration)
-    accum = ee.Algorithms.If(ee.Algorithms.IsEqual(
-        previous, None), current, previous.addBands(ee.Image(current)))
-    # Return the accumulation
-    return accum
+    # Get all the districts of India.
+    all_districts = get_districts()
 
+    start_date = '2005-10-1'
+    end_date = '2019-12-31'
 
-states = ["Gujarat", "Bihar", "Haryana", "Madhya Pradesh",
-          "Uttar Pradesh", "Rajasthan", "Punjab"]
+    sr_image_collection = ee.ImageCollection("MODIS/006/MOD09A1") \
+                            .filterDate(start_date, end_date)
 
+    sr_image = sr_image_collection.iterate(append_band)
+    sr_image = ee.Image(sr_image)
 
-# df = pd.read_csv("../data/states_centroid.csv")
-# df["State.Name"] = df["State.Name"].apply(lambda name: name.title().strip())
-# df = df[df["State.Name"].isin(states)]
-# states_coords = {}
-# for state, lat, lon in df.values:
-#   states_coords[state] = (float(lon), float(lat))
+    # Split the surface relectance bands into 2 separate images since there
+    # are a lot of bands and the data might be too large to fit into a single
+    # image for large districts.
+    sr_narrowband_image = sr_image.select([0, 1, 2, 3])
+    sr_wideband_image = sr_image.select([4, 5, 6])
 
-# Get a feature collection of level 2 administrative boundaries.
-districts = ee.FeatureCollection(
-    "FAO/GAUL/2015/level2").select('ADM1_NAME', 'ADM2_NAME')
+    # Use all cores except 1.
+    no_of_cores = -2
+    export_state_sr_narrowband_data = partial(export_state_data,
+                                              sr_narrowband_image,
+                                              'surface reflectance 1',
+                                              all_districts)
+    export_state_sr_wideband_data = partial(export_state_data,
+                                            sr_wideband_image,
+                                            'surface reflectance 2',
+                                            all_districts)
 
-india_bounding_box = ee.Geometry.Rectangle(
-    66.093750, 7.841615, 98.261719, 36.914764)
-start_date = '2005-1-1'
-end_date = '2020-12-31'
-
-sr_image_collection = ee.ImageCollection("MODIS/006/MOD09A1") \
-                        .filterBounds(india_bounding_box) \
-                        .filterDate(start_date, end_date)
-
-image = sr_image_collection.iterate(appendBand)
-image = ee.Image(image)
-
-for state in states:
-    # Filter the feature collection to subset this state.
-    state_districts = districts.filter(ee.Filter.eq('ADM1_NAME', state))
-
-    # Extract the features from the feature collection.
-    state_districts = state_districts.getInfo()['features']
-
-    for district in state_districts:
-        names = district["properties"]
-        # Make file name of format state_district.
-        fname = f'{names["ADM1_NAME"]}_{names["ADM2_NAME"]}'
-        region = district['geometry']
-
-        scale = 500
-
-        while True:
-            try:
-                export_image(image.clip(region), fname,
-                             'surface reflectance', scale)
-            except ee.ee_exception.EEException:
-                print('Retry')
-                time.sleep(10)
-                continue
-            break
+    Parallel(n_jobs=no_of_cores, backend='multiprocessing')(
+        export_state_sr_narrowband_data(state_name)
+        for state_name in state_names)
+    Parallel(n_jobs=no_of_cores, backend='multiprocessing')(
+        export_state_sr_wideband_data(state_name)
+        for state_name in state_names)
